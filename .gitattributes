@@ -1,0 +1,15 @@
+# 关键：禁止 Git 做任何换行符转换。
+# Windows 上默认 core.autocrlf=true，会把 .mca 等二进制存档当文本处理，
+# 一转换存档就废了。这一行是仓库的安全带，别删。
+* -text
+
+# 显式标注二进制，让 git diff / merge 不去按文本比较它们
+*.mca       binary
+*.mcr       binary
+*.dat       binary
+*.dat_old   binary
+*.nbt       binary
+*.jar       binary
+*.zip       binary
+*.png       binary
+*.lock      binary
