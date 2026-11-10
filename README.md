@@ -30,6 +30,7 @@
 | --- | --- |
 | `world/` | 存档。就是 `.minecraft\saves\` 下面那个世界文件夹的**整个内容** |
 | `mods/` | 模组 `.jar`。方案 B 时服务端的 `mods/` 也用这份 |
+| `game-dir.sample.txt` | 游戏目录的模板，复制改名成 `game-dir.txt` 填自己的路径 |
 | `scripts/sync.ps1` | 同步脚本本体（PowerShell） |
 | `pull.bat` | 双击 = 拉取存档 |
 | `push.bat` | 双击 = 推送存档 |
@@ -40,18 +41,37 @@
 
 ## 首次准备
 
-1. 复制你的世界文件夹内容到 `world/`
-   ```bash
-   # 示例：把本地世界「我的世界」拷进仓库
-   robocopy "%APPDATA%\.minecraft\saves\我的世界" world /E
-   ```
-2. 模组 `.jar` 丢进 `mods/`
-3. 提交推送：
-   ```bash
-   git add -A
-   git commit -m "init: 初始存档与模组"
-   git push
-   ```
+### 第 0 步：告诉脚本你的游戏装在哪
+
+把 `game-dir.sample.txt` 复制一份、改名成 `game-dir.txt`，里面只写一行：**包含 `saves`、`mods`、`versions` 的那一层文件夹**。
+
+```
+E:\HMCL\HMCL3.9.1\.minecraft
+```
+
+- 官方启动器一般是 `C:\Users\你的用户名\AppData\Roaming\.minecraft`，那就写这个；
+- 用 HMCL / PCL 这类启动器，游戏目录经常被改到别处，去启动器设置里看「游戏目录」那一栏；
+- 不填这行会默认用 `%APPDATA%\.minecraft`，填错了脚本会直接报「找不到存档目录」，不会乱动你的东西。
+
+`game-dir.txt` 不会被提交到仓库（已写进 `.gitignore`），所以你和朋友各自的路径互不干扰。
+
+**这一步不做，后面全都白搭**，因为脚本找不到存档就等于没存档。
+
+### 第 1 步：把存档传上去
+
+其实不用手动放文件，跑一次 `push.bat`，脚本问你选哪个世界，然后自动把那个世界文件夹的内容复制进 `world/` 再提交。
+
+想手动放也行，注意**不要把世界文件夹整个套进去**，要的是里面的内容：
+
+```
+world\level.dat        ✅ 正确
+world\region\r.0.0.mca ✅ 正确
+world\新的世界\level.dat ❌ 多套了一层，脚本会当成空存档
+```
+
+### 第 2 步：模组丢进 `mods/`
+
+两边的模组列表必须一模一样。
 
 ---
 

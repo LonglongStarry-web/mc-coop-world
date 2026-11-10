@@ -1,0 +1,10 @@
+# 把这个文件复制一份，改名为 game-dir.txt，然后把下面那行路径改成你自己的。
+# game-dir.txt 已经在 .gitignore 里，不会被提交，也不会和朋友的路径打架。
+#
+# 要写的是「包含 saves、mods、versions 的那一层文件夹」：
+#   官方启动器  C:\Users\你的用户名\AppData\Roaming\.minecraft
+#   HMCL/PCL    去启动器设置里看「游戏目录」那一栏
+#
+# 只改下面这一行，'#' 开头的行会被忽略。
+
+C:\Users\你的用户名\AppData\Roaming\.minecraft

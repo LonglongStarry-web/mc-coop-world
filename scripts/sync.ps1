@@ -30,8 +30,12 @@ param(
     # 世界文件夹名。不填就自动列出存档目录让你选。
     [string]$WorldName,
 
-    # 默认读 %APPDATA%\.minecraft\saves
-    [string]$SavesDir = (Join-Path $env:APPDATA '.minecraft\saves'),
+    # 游戏目录（里面要有 saves 那一层）。不填就读仓库根目录的 game-dir.txt，
+    # 再不行才退回默认的 %APPDATA%\.minecraft。
+    [string]$GameDir,
+
+    # 直接指定存档目录，优先级最高，一般只有测试时才用
+    [string]$SavesDir,
 
     # push 时跳过确认，直接提交推送
     [switch]$Yes
@@ -41,6 +45,38 @@ $ErrorActionPreference = 'Stop'
 
 $repoRoot  = Split-Path -Parent $PSScriptRoot
 $repoWorld = Join-Path $repoRoot 'world'
+
+# ---------------------------------------------------------------- 定位游戏目录
+
+if (-not $SavesDir) {
+
+    if (-not $GameDir) {
+        $cfg = Join-Path $repoRoot 'game-dir.txt'
+        if (Test-Path -LiteralPath $cfg) {
+            $line = Get-Content -LiteralPath $cfg -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Trim() -and -not $_.Trim().StartsWith('#') } |
+                    Select-Object -First 1
+            if ($line) { $GameDir = $line.Trim() }
+        }
+    }
+
+    if (-not $GameDir) { $GameDir = Join-Path $env:APPDATA '.minecraft' }
+
+    $SavesDir = Join-Path $GameDir 'saves'
+}
+
+if (-not (Test-Path -LiteralPath $SavesDir)) {
+    throw @"
+找不到存档目录：$SavesDir
+
+你的游戏可能不是默认安装位置。解决办法：
+在仓库根目录的 game-dir.txt 里写上游戏目录（含 saves 的那一层），只写路径，例如：
+
+    E:\HMCL\HMCL3.9.1\.minecraft
+
+改完再跑一次就行。
+"@
+}
 
 # ---------------------------------------------------------------- 小工具
 
@@ -85,9 +121,15 @@ function Resolve-WorldName {
     if ($worlds.Count -eq 0) { throw "这个目录下没有可用的世界：$Saves" }
     if ($worlds.Count -eq 1) { return $worlds[0].Name }
 
+    # 列出名字、最后修改时间、体积，方便认出哪个是在玩的那个
     Write-Host '找到多个世界，选一个：' -ForegroundColor Cyan
     for ($i = 0; $i -lt $worlds.Count; $i++) {
-        Write-Host ('  [{0}] {1}' -f ($i + 1), $worlds[$i].Name)
+        $w = $worlds[$i]
+        $bytes = (Get-ChildItem -LiteralPath $w.FullName -Recurse -File -ErrorAction SilentlyContinue |
+                  Measure-Object -Property Length -Sum).Sum
+        if (-not $bytes) { $bytes = 0 }
+        Write-Host ('  [{0}]  {1}  {2,10}  ' -f ($i + 1), $w.LastWriteTime.ToString('yyyy-MM-dd HH:mm'), (Format-Size $bytes)) -NoNewline
+        Write-Host $w.Name
     }
     while ($true) {
         $pick = Read-Host '输入序号'
@@ -105,6 +147,7 @@ $WorldName  = Resolve-WorldName -Name $WorldName -Saves $SavesDir
 $localWorld = Join-Path $SavesDir $WorldName
 
 Write-Host "仓库：$repoRoot"
+Write-Host "存档：$SavesDir"
 Write-Host "世界：$WorldName"
 Write-Host ''
 
@@ -113,6 +156,15 @@ switch ($Mode) {
     # ============================================================ pull
     'pull' {
         if (-not (Test-Path -LiteralPath $repoWorld)) { throw "仓库里没有 world 文件夹：$repoWorld" }
+
+        # 仓库里还是空的就别白跑一趟，还会把本地存档覆盖成空
+        $realFiles = @(Get-ChildItem -LiteralPath $repoWorld -Recurse -File -Force -ErrorAction SilentlyContinue |
+                       Where-Object { $_.Name -notin @('.gitkeep', 'README.md') })
+        if ($realFiles.Count -eq 0) {
+            Write-Host '仓库里还没有存档，没有东西可拉。' -ForegroundColor Yellow
+            Write-Host '先跑一次 push，把你本机的世界传上来。' -ForegroundColor Yellow
+            exit 1
+        }
 
         if (Test-Path -LiteralPath $localWorld) {
             $backup = "$localWorld.bak-$(Get-Date -Format 'yyyyMMdd-HHmmss')"

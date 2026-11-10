@@ -15,6 +15,11 @@ desktop.ini
 .vscode/
 .idea/
 
+# ---- 本机专属配置 ----
+# 每台机器的游戏路径都不一样，提交上去两人一改就冲突。
+# 模板是 game-dir.sample.txt，复制改名成 game-dir.txt 自用。
+game-dir.txt
+
 # ---- 本地备份 / 临时文件 ----
 *.bak
 *.bak-*
