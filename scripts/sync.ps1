@@ -198,13 +198,13 @@ switch ($Mode) {
         }
 
         Write-Host ''
-        Write-Host ('{0,-8} {1,-10} {2}' -f '状态', '大小', '文件') -ForegroundColor Cyan
-        Write-Host ('{0,-8} {1,-10} {2}' -f '--------', '----------', '----')
+        Write-Host ('本次改动 {0} 个文件：' -f $rows.Count) -ForegroundColor Cyan
         foreach ($r in ($rows | Sort-Object -Property Size -Descending)) {
-            Write-Host ('{0,-8} {1,-10} {2}' -f $r.Kind, (Format-Size $r.Size), $r.Path)
+            $label = if ($r.Kind -eq '删除') { $r.Path + '  (已删除)' } else { $r.Path }
+            Write-Host ('{0,12}  {1}' -f (Format-Size $r.Size), $label)
         }
         Write-Host ''
-        Write-Host ('合计 {0} 个文件，{1}。' -f $rows.Count, (Format-Size $total))
+        Write-Host ('合计 {0}' -f (Format-Size $total))
         Write-Host '这是这批文件的总大小，实际上传的字节一般远小于它：' -ForegroundColor Yellow
         Write-Host 'Git 只传变化的部分，没动过的文件一个字节都不发，改过的 .mca 也只发增量。' -ForegroundColor Yellow
 
@@ -214,7 +214,9 @@ switch ($Mode) {
             if ($ans) {
                 $a = $ans.Trim().ToLower()
                 if ($a -ne '' -and $a -ne 'y' -and $a -ne 'yes') {
-                    & git -C $repoRoot reset --quiet
+                    & git -C $repoRoot reset --quiet 2>$null
+                    # 把工作区也还原回去，不然仓库里会留一堆没提交的改动
+                    & git -C $repoRoot checkout -- world 2>$null
                     Write-Host '已取消，什么都没提交。' -ForegroundColor Yellow
                     exit 0
                 }
