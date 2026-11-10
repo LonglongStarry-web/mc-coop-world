@@ -104,6 +104,8 @@ powershell -ExecutionPolicy Bypass -File scripts\sync.ps1 push -Yes
 
 `pull` 前也会先把本地存档整份备份成 `<世界名>.bak-年月日-时分秒`，搞坏了改回原名就回退。
 
+拉下来的存档落在 **`<游戏目录>\saves\<你选的世界名>\`**，脚本跑完会把完整路径打出来。本地还没有这个世界时会自动新建；连 `saves` 目录都没有的（全新装的游戏）也会一并建出来。
+
 不想用脚本的话，手动也只要两条命令：
 
 ```bash

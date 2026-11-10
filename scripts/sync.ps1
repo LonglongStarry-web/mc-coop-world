@@ -66,7 +66,13 @@ if (-not $SavesDir) {
 }
 
 if (-not (Test-Path -LiteralPath $SavesDir)) {
-    throw @"
+    # 第一次玩的人可能连 saves 都还没有，pull 的时候直接建出来
+    if ($Mode -eq 'pull') {
+        New-Item -ItemType Directory -Path $SavesDir -Force | Out-Null
+        Write-Host "存档目录不存在，已新建：$SavesDir" -ForegroundColor Yellow
+    }
+    else {
+        throw @"
 找不到存档目录：$SavesDir
 
 你的游戏可能不是默认安装位置。解决办法：
@@ -76,6 +82,7 @@ if (-not (Test-Path -LiteralPath $SavesDir)) {
 
 改完再跑一次就行。
 "@
+    }
 }
 
 # ---------------------------------------------------------------- 小工具
@@ -105,20 +112,37 @@ function Invoke-Robocopy {
 }
 
 function Resolve-WorldName {
-    param([string]$Name, [string]$Saves)
+    param([string]$Name, [string]$Saves, [switch]$AllowNew)
 
     if ($Name) {
         $path = Join-Path $Saves $Name
-        if (-not (Test-Path -LiteralPath $path)) { throw "找不到存档目录：$path" }
+        if (-not (Test-Path -LiteralPath $path) -and -not $AllowNew) {
+            throw "找不到存档目录：$path"
+        }
         return $Name
     }
 
-    if (-not (Test-Path -LiteralPath $Saves)) { throw "找不到 Minecraft 存档目录：$Saves" }
+    if (-not (Test-Path -LiteralPath $Saves)) {
+        if ($AllowNew) { New-Item -ItemType Directory -Path $Saves -Force | Out-Null }
+        else { throw "找不到 Minecraft 存档目录：$Saves" }
+    }
 
     $worlds = @(Get-ChildItem -LiteralPath $Saves -Directory |
                 Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'level.dat') })
 
-    if ($worlds.Count -eq 0) { throw "这个目录下没有可用的世界：$Saves" }
+    if ($worlds.Count -eq 0) {
+        # 全新机器，本地一个世界都没有：让他自己起个名字，pull 会建成这个
+        if ($AllowNew) {
+            Write-Host '你本地还没有任何世界，这次会新建一个。' -ForegroundColor Cyan
+            while ($true) {
+                $newName = Read-Host '给这个存档起个名字（随便起，比如 双人世界）'
+                if ($newName -and $newName.Trim()) { return $newName.Trim() }
+                Write-Host '名字不能为空。' -ForegroundColor Yellow
+            }
+        }
+        throw "这个目录下没有可用的世界：$Saves"
+    }
+
     if ($worlds.Count -eq 1) { return $worlds[0].Name }
 
     # 列出名字、最后修改时间、体积，方便认出哪个是在玩的那个
@@ -143,7 +167,7 @@ function Resolve-WorldName {
 
 # ---------------------------------------------------------------- 主流程
 
-$WorldName  = Resolve-WorldName -Name $WorldName -Saves $SavesDir
+$WorldName  = Resolve-WorldName -Name $WorldName -Saves $SavesDir -AllowNew:($Mode -eq 'pull')
 $localWorld = Join-Path $SavesDir $WorldName
 
 Write-Host "仓库：$repoRoot"
@@ -171,12 +195,18 @@ switch ($Mode) {
             Write-Host "[1/2] 备份本地存档 -> $(Split-Path -Leaf $backup)"
             Copy-Item -LiteralPath $localWorld -Destination $backup -Recurse -Force
         }
+        else {
+            Write-Host '[1/2] 本地没有这个存档，直接新建'
+        }
 
-        Write-Host '[2/2] 拉取 仓库 world/ -> 本地存档'
+        Write-Host '[2/2] 拉取 仓库 world/ -> 下面这个目录'
+        Write-Host "      $localWorld" -ForegroundColor Cyan
         Invoke-Robocopy -Source $repoWorld -Dest $localWorld
 
         Write-Host ''
-        Write-Host '完成。进游戏前确认游戏版本和模组列表跟朋友一致。' -ForegroundColor Green
+        Write-Host '完成。存档在：' -ForegroundColor Green
+        Write-Host "  $localWorld" -ForegroundColor Green
+        Write-Host '进游戏前确认游戏版本和模组列表跟朋友一致。' -ForegroundColor Green
     }
 
     # ============================================================ push
