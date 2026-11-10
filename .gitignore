@@ -1,0 +1,22 @@
+# ---- Minecraft 运行时产生的垃圾 ----
+# 存档锁、日志、崩溃报告都不需要进版本库
+world/**/session.lock
+world/**/level.dat_old
+world/**/logs/
+world/**/crash-reports/
+logs/
+crash-reports/
+*.log
+
+# ---- 系统 / 编辑器 ----
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+
+# ---- 本地备份 / 临时文件 ----
+*.bak
+*.bak-*
+*.tmp
+.world-backup/
