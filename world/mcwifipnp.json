@@ -1,0 +1,16 @@
+{
+  "port": 58186,
+  "allow-host-cheat": true,
+  "max-players": 8,
+  "gamemode": "survival",
+  "motd": "chuuyea - 新的世界",
+  "allow-everyone-cheat": false,
+  "enforce-whitelist": false,
+  "enable-upnp": true,
+  "online-mode": false,
+  "enable-uuid-fixer": false,
+  "pvp": true,
+  "get-public-ip": true,
+  "remove-player-reporting": false,
+  "apply-for-all-world": false
+}
