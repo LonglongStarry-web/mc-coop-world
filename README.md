@@ -95,6 +95,7 @@ gh api -X PUT repos/LonglongStarry-web/mc-coop-world/collaborators/对方用户�
 - **版本必须完全一致**：Java 版版本号、Forge/Fabric 版本、模组列表，差一个都可能崩或者读坏存档。改模组前先说一声。
 - **同一次只能一个人写入**：两人同时改存档还都 push，Git 处理不了二进制的 `.mca`，只能二选一。约定好「现在谁在玩」。
 - **玩之前先 pull，玩完立刻 push**，别攒着，攒越久分叉越麻烦。
+- **别删 `.gitattributes`**：里面那行 `* -text` 是安全带。Windows 上 Git 默认会把文件当文本做换行符转换，`.mca` 一被转换存档就废了。
 - **别提交 `session.lock`、`logs/`、`crash-reports/`**，`.gitignore` 已经挡住了。
 - **别在游戏开着的时候 push**，存档还在写，容易推出半截文件。先退出游戏。
 - 仓库是**公开**的，内容任何人可见。想改私密：Settings → 最下方 Danger Zone → Change visibility。
