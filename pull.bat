@@ -6,5 +6,7 @@ rem is printed by the .ps1, which is UTF-8 with BOM.
 setlocal
 cd /d "%~dp0"
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\sync.ps1" pull %*
+set "syncExitCode=%errorlevel%"
 echo.
 pause
+exit /b %syncExitCode%

@@ -10,7 +10,8 @@
           会先列出这次到底改了哪些文件、多大，你确认之后才提交和推送。
           不想确认就加 -Yes。
 
-    不会删除任何文件，只会新增和覆盖。宁可留下旧文件，也不冒险删掉你的区块。
+    pull 会先更新 Git 仓库，再备份并完整同步本地世界。
+    两边的存档目录会保持一致，包括同步文件删除。
 
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File scripts\sync.ps1 pull
@@ -53,7 +54,7 @@ if (-not $SavesDir) {
     if (-not $GameDir) {
         $cfg = Join-Path $repoRoot 'game-dir.txt'
         if (Test-Path -LiteralPath $cfg) {
-            $line = Get-Content -LiteralPath $cfg -ErrorAction SilentlyContinue |
+            $line = Get-Content -LiteralPath $cfg -Encoding UTF8 -ErrorAction SilentlyContinue |
                     Where-Object { $_.Trim() -and -not $_.Trim().StartsWith('#') } |
                     Select-Object -First 1
             if ($line) { $GameDir = $line.Trim() }
@@ -87,28 +88,60 @@ if (-not (Test-Path -LiteralPath $SavesDir)) {
 
 # ---------------------------------------------------------------- 小工具
 
-function Format-Size {
-    param([long]$Bytes)
-    if ($Bytes -ge 1GB) { return ('{0:N2} GB' -f ($Bytes / 1GB)) }
-    if ($Bytes -ge 1MB) { return ('{0:N1} MB' -f ($Bytes / 1MB)) }
-    if ($Bytes -ge 1KB) { return ('{0:N0} KB' -f ($Bytes / 1KB)) }
-    return "$Bytes B"
-}
-
 function Invoke-Robocopy {
-    param([string]$Source, [string]$Dest)
+    param([string]$Source, [string]$Dest, [switch]$Preview, [switch]$Backup)
 
-    if (-not (Test-Path -LiteralPath $Dest)) {
+    if (-not $Preview -and -not (Test-Path -LiteralPath $Dest)) {
         New-Item -ItemType Directory -Path $Dest -Force | Out-Null
     }
 
-    # /E  含子目录（含空目录）
-    # /XF 排除仓库里的占位文件，别让它们被拷进存档目录
-    & robocopy $Source $Dest /E /XF '.gitkeep' 'README.md' /NFL /NDL /NJH /NJS /NP | Out-Null
+    # 备份只复制，正式同步使用 /MIR，使源中已删除的文件不会留在目标里。
+    # 排除正在持有的游戏锁、旧元数据备份和仓库占位文件。
+    $options = @('/MIR', '/R:2', '/W:1', '/XF', '.gitkeep', 'README.md', 'session.lock', 'level.dat_old',
+                 '/NDL', '/NJH', '/NJS', '/NP')
+    if ($Backup) { $options[0] = '/E' }
+    if ($Preview) {
+        & robocopy $Source $Dest @options /L /BYTES /FP
+    }
+    else {
+        & robocopy $Source $Dest @options /NFL | Out-Null
+    }
     $code = $LASTEXITCODE
 
     # robocopy 退出码 0-7 都算正常，>=8 才是真失败
     if ($code -ge 8) { throw "robocopy 失败，退出码 $code" }
+}
+
+function Invoke-Git {
+    param([string[]]$Arguments)
+    $result = & git -C $repoRoot @Arguments
+    if ($LASTEXITCODE -ne 0) { throw "Git 操作失败：git $($Arguments -join ' ')。请处理上面的错误后重试。" }
+    return $result
+}
+
+function Assert-World {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath (Join-Path $Path 'level.dat') -PathType Leaf)) {
+        throw "没有找到 level.dat，无法同步这个世界：$Path"
+    }
+}
+
+function Assert-NoLinks {
+    param([string]$Path)
+    # 镜像同步不能沿目录链接删除或覆盖世界目录之外的文件。
+    $parent = [IO.DirectoryInfo]::new($Path)
+    while ($parent) {
+        if ($parent.Exists -and ($parent.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw "存档路径包含目录链接，请改用实际目录：$($parent.FullName)"
+        }
+        $parent = $parent.Parent
+    }
+    if (Test-Path -LiteralPath $Path) {
+        $links = Get-ChildItem -LiteralPath $Path -Recurse -Force |
+                 Where-Object { $_.Attributes -band [IO.FileAttributes]::ReparsePoint } |
+                 Select-Object -First 1
+        if ($links) { throw "存档中存在文件或目录链接，无法镜像同步：$($links.FullName)" }
+    }
 }
 
 function Resolve-WorldName {
@@ -128,6 +161,7 @@ function Resolve-WorldName {
     }
 
     $worlds = @(Get-ChildItem -LiteralPath $Saves -Directory |
+                Where-Object { $_.Name -notlike '*.bak-*' } |
                 Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'level.dat') })
 
     if ($worlds.Count -eq 0) {
@@ -152,7 +186,7 @@ function Resolve-WorldName {
         $bytes = (Get-ChildItem -LiteralPath $w.FullName -Recurse -File -ErrorAction SilentlyContinue |
                   Measure-Object -Property Length -Sum).Sum
         if (-not $bytes) { $bytes = 0 }
-        Write-Host ('  [{0}]  {1}  {2,10}  ' -f ($i + 1), $w.LastWriteTime.ToString('yyyy-MM-dd HH:mm'), (Format-Size $bytes)) -NoNewline
+        Write-Host ('  [{0}]  {1}  {2,10:N1} MB  ' -f ($i + 1), $w.LastWriteTime.ToString('yyyy-MM-dd HH:mm'), ($bytes / 1MB)) -NoNewline
         Write-Host $w.Name
     }
     while ($true) {
@@ -167,165 +201,123 @@ function Resolve-WorldName {
 
 # ---------------------------------------------------------------- 主流程
 
-$WorldName  = Resolve-WorldName -Name $WorldName -Saves $SavesDir -AllowNew:($Mode -eq 'pull')
-$localWorld = Join-Path $SavesDir $WorldName
+$WorldName = Resolve-WorldName -Name $WorldName -Saves $SavesDir -AllowNew:($Mode -eq 'pull')
+# 同时检查命令行参数和交互输入。
+if ($WorldName -in @('.', '..') -or
+    $WorldName.IndexOfAny([IO.Path]::GetInvalidFileNameChars()) -ge 0 -or
+    $WorldName -ne $WorldName.Trim() -or $WorldName.EndsWith('.')) {
+    throw '世界名必须是单个合法文件夹名，不能包含路径或上级目录。'
+}
+$localWorld = [IO.Path]::GetFullPath((Join-Path $SavesDir $WorldName))
+$repoRoot = [IO.Path]::GetFullPath($repoRoot)
+$repoWorld = Join-Path $repoRoot 'world'
+if ($localWorld.StartsWith("$repoRoot\", [StringComparison]::OrdinalIgnoreCase) -or
+    $repoRoot.StartsWith("$localWorld\", [StringComparison]::OrdinalIgnoreCase) -or
+    $localWorld -eq $repoRoot) {
+    throw '游戏存档和同步仓库必须使用分开的目录。'
+}
+Assert-NoLinks -Path $localWorld
+Assert-NoLinks -Path $repoWorld
 
 Write-Host "仓库：$repoRoot"
-Write-Host "存档：$SavesDir"
-Write-Host "世界：$WorldName"
+Write-Host "世界：$localWorld"
 Write-Host ''
 
-switch ($Mode) {
+# 防止两个同步窗口同时改同一仓库。
+$gitTop = [IO.Path]::GetFullPath((Invoke-Git -Arguments @('rev-parse', '--show-toplevel')))
+if ($gitTop -ne $repoRoot) { throw '请使用 git clone 得到的独立仓库目录，再运行脚本。' }
+$gitDir = Invoke-Git -Arguments @('rev-parse', '--absolute-git-dir')
+$syncLock = $null
+$worldLock = $null
+try {
+    try {
+        $syncLock = [IO.File]::Open((Join-Path $gitDir 'mc-sync.lock'), 'OpenOrCreate', 'ReadWrite', 'None')
+    }
+    catch { throw '另一个同步正在运行，请等它结束再试。' }
 
-    # ============================================================ pull
-    'pull' {
-        if (-not (Test-Path -LiteralPath $repoWorld)) { throw "仓库里没有 world 文件夹：$repoWorld" }
-
-        # 仓库里还是空的就别白跑一趟，还会把本地存档覆盖成空
-        $realFiles = @(Get-ChildItem -LiteralPath $repoWorld -Recurse -File -Force -ErrorAction SilentlyContinue |
-                       Where-Object { $_.Name -notin @('.gitkeep', 'README.md') })
-        if ($realFiles.Count -eq 0) {
-            Write-Host '仓库里还没有存档，没有东西可拉。' -ForegroundColor Yellow
-            Write-Host '先跑一次 push，把你本机的世界传上来。' -ForegroundColor Yellow
-            exit 1
+    if (Test-Path -LiteralPath $localWorld -PathType Container) {
+        try {
+            $worldLock = [IO.File]::Open((Join-Path $localWorld 'session.lock'), 'OpenOrCreate', 'ReadWrite', 'None')
         }
-
-        if (Test-Path -LiteralPath $localWorld) {
-            $backup = "$localWorld.bak-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
-            Write-Host "[1/2] 备份本地存档 -> $(Split-Path -Leaf $backup)"
-            Copy-Item -LiteralPath $localWorld -Destination $backup -Recurse -Force
-        }
-        else {
-            Write-Host '[1/2] 本地没有这个存档，直接新建'
-        }
-
-        Write-Host '[2/2] 拉取 仓库 world/ -> 下面这个目录'
-        Write-Host "      $localWorld" -ForegroundColor Cyan
-        Invoke-Robocopy -Source $repoWorld -Dest $localWorld
-
-        Write-Host ''
-        Write-Host '完成。存档在：' -ForegroundColor Green
-        Write-Host "  $localWorld" -ForegroundColor Green
-        Write-Host '进游戏前确认游戏版本和模组列表跟朋友一致。' -ForegroundColor Green
+        catch { throw '存档正在使用或无法访问。请退出这个世界，再重新同步。' }
     }
 
-    # ============================================================ push
-    'push' {
-        if (-not (Test-Path -LiteralPath $localWorld)) { throw "找不到本地存档：$localWorld" }
+    # 所有网络错误都停止，避免把旧仓库存档当作最新进度导入游戏。
+    $upstream = Invoke-Git -Arguments @('rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}')
+    $remoteName = Invoke-Git -Arguments @('config', "branch.$(Invoke-Git -Arguments @('branch', '--show-current')).remote")
+    Write-Host '[1/3] 检查远端进度'
+    Invoke-Git -Arguments @('fetch', $remoteName) | Out-Host
+    $behind = [int](Invoke-Git -Arguments @('rev-list', '--count', "HEAD..$upstream"))
+    $ahead = [int](Invoke-Git -Arguments @('rev-list', '--count', "$upstream..HEAD"))
 
-        # --- 先确认远端没有别人推的新东西，否则等下推上去会被拒 ---
-        Write-Host '[1/4] 检查远端有没有新进度'
-        $fetched = $false
-        try {
-            & git -C $repoRoot fetch --quiet origin 2>$null
-            $fetched = ($LASTEXITCODE -eq 0)
-        }
-        catch {
-            $fetched = $false
-        }
-
-        if ($fetched) {
-            $behind = & git -C $repoRoot rev-list --count 'HEAD..@{u}' 2>$null
-            if ($behind -and [int]$behind -gt 0) {
-                Write-Host ''
-                Write-Host "远端有 $behind 个你本地没有的提交——朋友已经推过新进度了。" -ForegroundColor Red
-                Write-Host '直接推会冲突。存档是二进制文件，合不了，只能二选一。' -ForegroundColor Red
-                Write-Host ''
-                Write-Host '所以这次什么都没做。下一步：' -ForegroundColor Yellow
-                Write-Host '  · 先跑 pull：把朋友的进度拉下来（你本地这份会自动备份，想回退改回名字就行）' -ForegroundColor Yellow
-                Write-Host '  · 如果确定要保留你本地这份、不要朋友那份，再来找我，这种覆盖操作我单独帮你做' -ForegroundColor Yellow
-                exit 1
+    switch ($Mode) {
+        'pull' {
+            if ($ahead -gt 0) {
+                throw '本地还有未推送的提交。请先运行 push.bat 交接本地进度，再拉取。'
             }
-            Write-Host '      远端是最新的，可以推'
-        }
-        else {
-            Write-Host '      没连上远端，跳过检查' -ForegroundColor Yellow
-        }
+            $dirty = Invoke-Git -Arguments @('status', '--porcelain')
+            if ($dirty) { throw '仓库中有未提交的改动。请先提交或备份处理这些改动，再拉取。' }
 
-        # --- 复制到仓库工作区 ---
-        Write-Host '[2/4] 把本地存档复制进仓库 world/'
-        Invoke-Robocopy -Source $localWorld -Dest $repoWorld
+            Invoke-Git -Arguments @('merge', '--ff-only', $upstream) | Out-Host
+            # 更新仓库后再验证，支持远端首次加入存档，也防止误导入空目录。
+            Assert-World -Path $repoWorld
+            Assert-NoLinks -Path $repoWorld
 
-        # --- 算出这次到底改了什么 ---
-        Write-Host '[3/4] 对比差异'
-        & git -C $repoRoot add -- world 2>$null
-
-        $numstat = & git -C $repoRoot diff --cached --numstat -- world
-        if (-not $numstat -or $numstat.Count -eq 0) {
-            Write-Host ''
-            Write-Host '存档和仓库里完全一致，没有需要推送的内容。' -ForegroundColor Green
-            exit 0
-        }
-
-        $total = 0
-        $rows  = @()
-        foreach ($line in $numstat) {
-            $cols = $line -split "`t"
-            if ($cols.Count -lt 3) { continue }
-
-            $rel  = $cols[2]
-            $full = Join-Path $repoRoot ($rel -replace '/', '\')
-
-            if (Test-Path -LiteralPath $full) {
-                $size = (Get-Item -LiteralPath $full).Length
-                $kind = '新增/修改'
+            if (Test-Path -LiteralPath $localWorld) {
+                $backup = "$localWorld.bak-$(Get-Date -Format 'yyyyMMdd-HHmmss-fff')-$([Guid]::NewGuid().ToString('N').Substring(0, 8))"
+                Write-Host "[2/3] 备份本地存档 -> $backup"
+                Invoke-Robocopy -Source $localWorld -Dest $backup -Backup
             }
             else {
-                $size = 0
-                $kind = '删除'
+                Write-Host '[2/3] 本地没有这个存档，直接新建'
+                New-Item -ItemType Directory -Path $localWorld | Out-Null
+                $worldLock = [IO.File]::Open((Join-Path $localWorld 'session.lock'), 'OpenOrCreate', 'ReadWrite', 'None')
             }
 
-            $total += $size
-            $rows  += [pscustomobject]@{ Kind = $kind; Size = $size; Path = $rel }
+            Write-Host '[3/3] 导入最新存档'
+            Invoke-Robocopy -Source $repoWorld -Dest $localWorld
+            Write-Host "完成。存档在：$localWorld" -ForegroundColor Green
         }
 
-        Write-Host ''
-        Write-Host ('本次改动 {0} 个文件：' -f $rows.Count) -ForegroundColor Cyan
-        foreach ($r in ($rows | Sort-Object -Property Size -Descending)) {
-            $label = if ($r.Kind -eq '删除') { $r.Path + '  (已删除)' } else { $r.Path }
-            Write-Host ('{0,12}  {1}' -f (Format-Size $r.Size), $label)
-        }
-        Write-Host ''
-        Write-Host ('合计 {0}' -f (Format-Size $total))
-        Write-Host '这是这批文件的总大小，实际上传的字节一般远小于它：' -ForegroundColor Yellow
-        Write-Host 'Git 只传变化的部分，没动过的文件一个字节都不发，改过的 .mca 也只发增量。' -ForegroundColor Yellow
+        'push' {
+            Assert-World -Path $localWorld
+            if ($behind -gt 0) {
+                throw "远端有 $behind 个本地没有的提交。请先备份当前游戏存档，再拉取并确认采用哪份进度。"
+            }
 
-        if (-not $Yes) {
-            Write-Host ''
-            $ans = Read-Host '确认推送？(Y/n)'
-            if ($ans) {
-                $a = $ans.Trim().ToLower()
-                if ($a -ne '' -and $a -ne 'y' -and $a -ne 'yes') {
-                    & git -C $repoRoot reset --quiet 2>$null
-                    # 把工作区也还原回去，不然仓库里会留一堆没提交的改动
-                    & git -C $repoRoot checkout -- world 2>$null
-                    Write-Host '已取消，什么都没提交。' -ForegroundColor Yellow
+            # 先检查提交身份，避免复制后才发现 Git 尚未配置姓名和邮箱。
+            Invoke-Git -Arguments @('var', 'GIT_AUTHOR_IDENT') | Out-Null
+            Invoke-Git -Arguments @('var', 'GIT_COMMITTER_IDENT') | Out-Null
+            Write-Host '[2/3] 预览存档变化（字节数为文件大小，传输量取决于 Git 压缩）'
+            Invoke-Robocopy -Source $localWorld -Dest $repoWorld -Preview
+            if (-not $Yes) {
+                Write-Host '目标目录将与本地世界一致，包括删除目标中多出的存档文件。' -ForegroundColor Yellow
+                $answer = Read-Host '确认同步并推送？(Y/n)'
+                if ($answer -and $answer.Trim().ToLower() -notin @('', 'y', 'yes')) {
+                    Write-Host '已取消。' -ForegroundColor Yellow
                     exit 0
                 }
             }
+
+            Invoke-Robocopy -Source $localWorld -Dest $repoWorld
+            Invoke-Git -Arguments @('add', '--', 'world')
+            $changes = Invoke-Git -Arguments @('diff', '--cached', '--name-only', '--', 'world')
+            if ($changes) {
+                Invoke-Git -Arguments @('diff', '--cached', '--stat', '--', 'world') | Out-Host
+                $stamp = Get-Date -Format 'yyyy-MM-dd HH:mm'
+                # 只提交存档，避免把其他已经暂存的文件一并提交。
+                Invoke-Git -Arguments @('commit', '--only', '-m', "sync: $WorldName @ $stamp", '--', 'world') | Out-Host
+            }
+
+            Write-Host '[3/3] 推送进度'
+            # 即使文件没有新变化，也推送先前因断网或权限问题留在本地的提交。
+            # 失败时保留提交，恢复网络或权限后再次双击 push.bat 即可重试。
+            Invoke-Git -Arguments @('push') | Out-Host
+            Write-Host '完成。现在可以叫朋友双击 pull.bat 了。' -ForegroundColor Green
         }
-
-        # --- 提交并推送 ---
-        Write-Host ''
-        Write-Host '[4/4] 提交并推送'
-        $stamp = Get-Date -Format 'yyyy-MM-dd HH:mm'
-        & git -C $repoRoot commit --quiet -m "sync: $WorldName @ $stamp"
-        if ($LASTEXITCODE -ne 0) {
-            Write-Host '提交失败，可能没有实际变化。' -ForegroundColor Red
-            exit 1
-        }
-
-        & git -C $repoRoot push
-
-        if ($LASTEXITCODE -ne 0) {
-            Write-Host ''
-            Write-Host '推送被拒绝。撤销这次提交，什么都没丢：' -ForegroundColor Red
-            Write-Host '    git reset --soft HEAD~1' -ForegroundColor Red
-            Write-Host '然后跑 pull 把远端拉下来看看。' -ForegroundColor Red
-            exit 1
-        }
-
-        Write-Host ''
-        Write-Host '完成。现在可以叫朋友 pull 了。' -ForegroundColor Green
     }
+}
+finally {
+    if ($worldLock) { $worldLock.Dispose() }
+    if ($syncLock) { $syncLock.Dispose() }
 }
