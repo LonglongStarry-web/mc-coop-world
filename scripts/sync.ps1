@@ -26,6 +26,11 @@
     pull 会先更新 Git 仓库，再备份并完整同步本地世界。
     两边的存档目录会保持一致，包括同步文件删除。
 
+    网络：到 GitHub 的直连经常时通时不通（Failed to connect to github.com
+    port 443）。每次网络操作前会先探测直连，不通就自动借用本机正在运行的
+    代理（10808 / 7890 等），两条路都带重试。代理只对本次 git 命令生效，
+    不改 git 全局配置；也可以用 -Proxy 手动指定。
+
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File scripts\sync.ps1 pull
 
@@ -40,6 +45,9 @@
 
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File scripts\sync.ps1 push -SegmentMB 32
+
+.EXAMPLE
+    powershell -ExecutionPolicy Bypass -File scripts\sync.ps1 push -Proxy http://127.0.0.1:10808
 #>
 [CmdletBinding()]
 param(
@@ -61,9 +69,13 @@ param(
     # push 时跳过确认和选择，直接提交推送
     [switch]$Yes,
 
-    # 推送失败（网络重置）时自动重试的次数，默认 3；重试是从头再传一遍
+    # 网络操作（检查远端、推送）失败后自动重试的次数，默认 3
     [ValidateRange(1, 10)]
     [int]$PushRetries = 3,
+
+    # 手动指定代理，例如 http://127.0.0.1:10808 或 socks5h://127.0.0.1:10808。
+    # 不填时脚本会自动探测本机正在运行的代理（v2rayN / Clash 等）。
+    [string]$Proxy,
 
     # 分段推送：每段大约多少 MB。一次推几百 MB 容易被网络掐断，
     # 分成几十 MB 一段、推完一段再推下一段成功率高很多。0 表示不分段。
@@ -133,10 +145,249 @@ function Invoke-Git {
     return $result
 }
 
-# 存档一次动辄上百 MB。一次性推这么大的包很容易被中间网络重置
-# （curl 55 / RPC failed; Connection was reset / the remote end hung up），
-# 所以这里做两件事：调本仓库的 HTTP 设置，失败后自动重试。重试是从头再传一遍，Git 没有断点续传。
-# 返回 $true 表示确实推上去了。
+# ---------------------------------------------------------------- 网络自适应
+#
+# 到 GitHub 的直连经常是「时通时不通」：刚才还 200，一会儿就
+#   fatal: unable to access ...: Failed to connect to github.com port 443 after 21110 ms
+# 这种和存档、账号权限都没关系，原样重试同一个直连也没用。网络操作统一走
+# Invoke-GitNetwork：先花几秒探测直连，通就走直连；不通就自动借本机已经开着的
+# 代理（v2rayN 的 10808、Clash 的 7890 等）再试。代理只用 -c http.proxy=... 对这个
+# 进程生效，不改你的 git 全局配置。
+
+# 探测本机端口有没有在监听（异步 + 超时，连不上也不会卡住）
+function Test-TcpPort {
+    param([string]$TargetHost, [int]$Port, [int]$TimeoutMs = 3000)
+
+    $client = $null
+    try {
+        $client = New-Object System.Net.Sockets.TcpClient
+        $iar = $client.BeginConnect($TargetHost, $Port, $null, $null)
+        if (-not $iar.AsyncWaitHandle.WaitOne($TimeoutMs)) { return $false }
+        $client.EndConnect($iar)
+        return $true
+    }
+    catch { return $false }
+    finally { if ($client) { $client.Close() } }
+}
+
+# 从 remote 地址里取主机名，用来判断连通性
+function Get-RemoteUrl {
+    try {
+        $u = (& git -C $repoRoot remote get-url origin 2>$null)
+        if ($u) { return ([string]$u).Trim() }
+    }
+    catch { }
+    return $null
+}
+
+function Get-RemoteHost {
+    $url = Get-RemoteUrl
+    if (-not $url) { return 'github.com' }
+
+    if ($url -match '^[a-zA-Z][a-zA-Z0-9+.-]*://([^/:]+)') { return $Matches[1] }
+    if ($url -match '^[\w\.-]+@([^:]+):') { return $Matches[1] }
+    return 'github.com'
+}
+
+# 远端是磁盘路径或 file:// 时（本地裸仓库、局域网共享），不经过网络，别去探测代理
+function Test-RemoteIsLocal {
+    $url = Get-RemoteUrl
+    if (-not $url) { return $false }
+    if ($url -match '^file://') { return $true }
+    if ($url -match '://') { return $false }
+    if ($url -match '^[^\s@/\\]+@[^:]+:') { return $false }   # git@host:path 这种 SSH 地址
+    return $true
+}
+
+# 可尝试的代理：先看配置和环境变量，再看常见客户端在跑的本地端口
+function Get-ProxyCandidates {
+    $raw = @()
+    if ($Proxy) { $raw += $Proxy }
+    foreach ($v in @($env:HTTPS_PROXY, $env:https_proxy, $env:HTTP_PROXY, $env:http_proxy)) {
+        if ($v) { $raw += $v }
+    }
+    foreach ($scope in @('--local', '--global')) {
+        try {
+            $cfg = (& git -C $repoRoot config $scope http.proxy 2>$null)
+            if ($cfg) { $raw += $cfg }
+        }
+        catch { }
+    }
+
+    $result = New-Object System.Collections.ArrayList
+    $seen = @{}
+    foreach ($r in $raw) {
+        if (-not $r) { continue }
+        $u = ([string]$r).Trim()
+        if (-not $u) { continue }
+        if ($u -notmatch '://') { $u = "http://$u" }
+        if ($seen.ContainsKey($u)) { continue }
+        $seen[$u] = $true
+        [void]$result.Add([pscustomobject]@{ Url = $u })
+    }
+
+    # 常见本地端口：10808/1080 多半是 SOCKS，两种协议都排进去
+    $ports = @(
+        @{ Port = 10809; Scheme = 'http' },     # v2rayN 的 HTTP 端口
+        @{ Port = 7890; Scheme = 'http' },      # Clash
+        @{ Port = 7897; Scheme = 'http' },      # Clash Verge
+        @{ Port = 1080; Scheme = 'socks5h' },   # 通用 SOCKS
+        @{ Port = 10808; Scheme = 'http' },     # v2rayN 的 SOCKS 端口，也常兼容 HTTP
+        @{ Port = 10808; Scheme = 'socks5h' }
+    )
+    foreach ($p in $ports) {
+        $port = [int]$p.Port
+        if (-not (Test-TcpPort -TargetHost '127.0.0.1' -Port $port -TimeoutMs 400)) { continue }
+        $u = "$($p.Scheme)://127.0.0.1:$port"
+        if ($seen.ContainsKey($u)) { continue }
+        $seen[$u] = $true
+        [void]$result.Add([pscustomobject]@{ Url = $u })
+    }
+
+    return $result
+}
+
+# 判断失败是「连不上」还是「被拒绝」（权限、非快进、冲突）
+function Test-NetworkError {
+    param([string]$Text)
+    if (-not $Text) { return $false }
+    return ($Text -match 'Failed to connect' -or
+            $Text -match 'Could not connect to server' -or
+            $Text -match 'Could not resolve host' -or
+            $Text -match 'Connection was reset' -or
+            $Text -match 'Connection reset by peer' -or
+            $Text -match 'Connection timed out' -or
+            $Text -match 'Operation timed out' -or
+            $Text -match 'timed out' -or
+            $Text -match 'RPC failed' -or
+            $Text -match 'remote end hung up' -or
+            $Text -match 'unexpected disconnect' -or
+            $Text -match 'curl (5[5-9]|7|28|35|52)')
+}
+
+# 跑一条 git 命令，边跑边把输出打出来（大包上传的进度要看得见），同时收集文本
+function Invoke-GitCapture {
+    param([string[]]$Arguments, [switch]$Quiet)
+
+    $lines = New-Object System.Collections.ArrayList
+    $prevEap = $ErrorActionPreference
+    # 原生命令的 stderr 在 PS 5.1 里会变成 ErrorRecord，EAP=Stop 时可能直接把脚本打断
+    $ErrorActionPreference = 'Continue'
+    try {
+        & git @Arguments 2>&1 | ForEach-Object {
+            $line = if ($_ -is [System.Management.Automation.ErrorRecord]) { $_.Exception.Message } else { [string]$_ }
+            [void]$lines.Add($line)
+            if (-not $Quiet) { Write-Host $line }
+        }
+    }
+    finally { $ErrorActionPreference = $prevEap }
+
+    return @{ Code = $LASTEXITCODE; Lines = $lines }
+}
+
+# 统一入口：探测直连 -> 失败换本机代理 -> 每次尝试都可重试
+function Invoke-GitNetwork {
+    param(
+        [string[]]$Arguments,
+        [int]$Attempts = 3,
+        [switch]$Quiet
+    )
+
+    # 本地路径 / file:// 远端不经过网络，直接跑
+    if (Test-RemoteIsLocal) {
+        $r = Invoke-GitCapture -Arguments (@('-C', $repoRoot) + $Arguments) -Quiet:$Quiet
+        return @{ Ok = ($r.Code -eq 0); Network = $false; Proxy = $null; Lines = $r.Lines; Text = ($r.Lines -join "`n") }
+    }
+
+    $hostName = Get-RemoteHost
+    $directOk = Test-TcpPort -TargetHost $hostName -Port 443 -TimeoutMs 4000
+
+    $plan = New-Object System.Collections.ArrayList
+    if ($directOk) { [void]$plan.Add([pscustomobject]@{ Label = '直连'; Proxy = $null }) }
+    foreach ($p in (Get-ProxyCandidates)) {
+        [void]$plan.Add([pscustomobject]@{ Label = $p.Url; Proxy = $p.Url })
+    }
+
+    if ($plan.Count -eq 0) {
+        return @{ Ok = $false; Network = $true; Proxy = $null; Lines = @()
+            Text = "连不上 $hostName，也没有找到可用的本机代理。" }
+    }
+
+    if (-not $directOk) {
+        Write-Host ("  直连 {0} 不通（443 端口连不上），改试本机代理。" -f $hostName) -ForegroundColor Yellow
+    }
+
+    $lastText = ''
+    for ($n = 0; $n -lt $plan.Count; $n++) {
+        $node = $plan[$n]
+
+        for ($i = 1; $i -le $Attempts; $i++) {
+            if ($n -gt 0 -and $i -eq 1) {
+                Write-Host ("  改走 {0} 再试…" -f $node.Label) -ForegroundColor Cyan
+            }
+            elseif ($i -gt 1) {
+                Write-Host ("  第 {0}/{1} 次重试（{2}）…" -f $i, $Attempts, $node.Label) -ForegroundColor Cyan
+            }
+
+            $gargs = @('-C', $repoRoot)
+            if ($node.Proxy) { $gargs += @('-c', "http.proxy=$($node.Proxy)") }
+            $gargs += $Arguments
+
+            $r = Invoke-GitCapture -Arguments $gargs -Quiet:$Quiet
+            if ($r.Code -eq 0) {
+                if ($node.Proxy) {
+                    Write-Host ("  这次是通过本机代理 {0} 连上的。" -f $node.Label) -ForegroundColor DarkGray
+                }
+                return @{ Ok = $true; Network = $false; Proxy = $node.Proxy; Lines = $r.Lines; Text = '' }
+            }
+
+            $lastText = ($r.Lines -join "`n")
+            if (-not (Test-NetworkError -Text $lastText)) {
+                # 不是网络问题（权限、非快进、冲突…），换通路也没用，交回调用方
+                return @{ Ok = $false; Network = $false; Proxy = $node.Proxy; Lines = $r.Lines; Text = $lastText }
+            }
+
+            if ($i -lt $Attempts) {
+                $wait = 4 * $i
+                Write-Host ("  连不上，{0} 秒后重试。" -f $wait) -ForegroundColor Yellow
+                Start-Sleep -Seconds $wait
+            }
+        }
+
+        if ($n -lt $plan.Count - 1) {
+            Write-Host '  这条路还是不通，换下一条通路。' -ForegroundColor Yellow
+        }
+    }
+
+    return @{ Ok = $false; Network = $true; Proxy = $null; Lines = @(); Text = $lastText }
+}
+
+function Show-NetworkFailHelp {
+    param([string]$Reason)
+
+    Write-Host ''
+    if ($Reason) { Write-Host $Reason -ForegroundColor Red }
+    Write-Host '连不上 GitHub：这是本机到 github.com 的网络问题，' -ForegroundColor Red
+    Write-Host '和存档、账号权限都没有关系。' -ForegroundColor Red
+    Write-Host '存档和本地提交都还在，什么都没丢。' -ForegroundColor Yellow
+    Write-Host ''
+    Write-Host '可以这样排查：' -ForegroundColor Yellow
+    Write-Host ' 1. 浏览器打开 https://github.com，看能不能进。' -ForegroundColor Yellow
+    Write-Host '    进不去就说明网络被拦了或者断了。' -ForegroundColor Yellow
+    Write-Host ' 2. 代理软件要确认正在运行。脚本会自动借用' -ForegroundColor Yellow
+    Write-Host '    10808 / 7890 这类本地端口；也可以手动指定：' -ForegroundColor Yellow
+    Write-Host '    push.bat -Proxy http://127.0.0.1:10808' -ForegroundColor Yellow
+    Write-Host ' 3. 换个网络试试，手机热点通常比某些宽带稳。' -ForegroundColor Yellow
+    Write-Host ' 4. 一直不行就改用 SSH（走 443 端口，比 22 容易通）：' -ForegroundColor Yellow
+    Write-Host '    git remote set-url origin git@github.com:LonglongStarry-web/mc-coop-world.git' -ForegroundColor Yellow
+    Write-Host '    需要先在 GitHub 里配好 SSH 公钥，见使用指南。' -ForegroundColor Yellow
+}
+
+# 存档一次动辄上百 MB，一次性推大包很容易被中间网络重置
+# （curl 55 / RPC failed; Connection was reset / the remote end hung up）。
+# 这里负责：调本仓库的 HTTP 设置、失败重试、必要时换本机代理，
+# 最后再核对一次远端，避免「其实已经送到了」被当成失败重传一遍。
+# 返回 $true 表示远端确实收到了本地 HEAD。
 function Invoke-PushWithRetry {
     param([int]$Attempts = 3)
 
@@ -148,34 +399,29 @@ function Invoke-PushWithRetry {
     $head = (& git -C $repoRoot rev-parse HEAD)
     if ($head) { $head = $head.Trim() }
 
-    for ($i = 1; $i -le $Attempts; $i++) {
-        if ($i -gt 1) {
-            Write-Host "第 $i/$Attempts 次重试推送。每次都是从头发送，数据量大时需要几分钟，别关窗口。" -ForegroundColor Cyan
-        }
+    $r = Invoke-GitNetwork -Arguments @('push') -Attempts $Attempts
+    if ($r.Ok) { return $true }
 
-        $null = & git -C $repoRoot push
-        if ($LASTEXITCODE -eq 0) { return $true }
-
-        if ($i -lt $Attempts) {
-            $wait = 5 * $i
-            Write-Host "推送中断（连接被重置），$wait 秒后自动重试。" -ForegroundColor Yellow
-            Start-Sleep -Seconds $wait
-        }
+    # 被远端拒绝（权限、非快进、仓库规则）不是网络问题，把 git 的原话留下，别吞掉真正的原因
+    if (-not $r.Network) {
+        Write-Host ''
+        Write-Host '推送被远端拒绝了（不是网络问题）。下面是 git 的原话：' -ForegroundColor Red
+        if ($r.Text) { Write-Host $r.Text -ForegroundColor Yellow }
+        return $false
     }
 
     # 全部失败后再核对一次远端：可能包已经送到，只是回执阶段被掐断，避免白重传。
-    # 只在最后查一次，因为连不上时这个查询本身也要等 20 多秒。
     if ($branch -and $head) {
-        $remoteSha = $null
-        try {
-            $remoteRef = & git -C $repoRoot ls-remote origin "refs/heads/$branch"
-            if ($LASTEXITCODE -eq 0 -and $remoteRef) { $remoteSha = ($remoteRef -split '\s+')[0] }
-        }
-        catch { $remoteSha = $null }
-
-        if ($remoteSha -eq $head) {
-            Write-Host '连接报了错，但远端已经收到这次提交，按成功处理。' -ForegroundColor Yellow
-            return $true
+        $check = Invoke-GitNetwork -Arguments @('ls-remote', 'origin', "refs/heads/$branch") -Attempts 1 -Quiet
+        if ($check.Ok) {
+            $remoteSha = $null
+            foreach ($l in $check.Lines) {
+                if ($l -match '^([0-9a-f]{40})\s') { $remoteSha = $Matches[1]; break }
+            }
+            if ($remoteSha -eq $head) {
+                Write-Host '连接报了错，但远端已经收到这次提交，按成功处理。' -ForegroundColor Yellow
+                return $true
+            }
         }
     }
 
@@ -504,7 +750,12 @@ try {
     $upstream = Invoke-Git -Arguments @('rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}')
     $remoteName = Invoke-Git -Arguments @('config', "branch.$(Invoke-Git -Arguments @('branch', '--show-current')).remote")
     Write-Host '[2/4] 检查远端进度'
-    Invoke-Git -Arguments @('fetch', $remoteName) | Out-Host
+    # 直连不通会自动换本机代理，并带重试
+    $fetch = Invoke-GitNetwork -Arguments @('fetch', $remoteName) -Attempts $PushRetries -Quiet
+    if (-not $fetch.Ok) {
+        Show-NetworkFailHelp -Reason '拉取远端进度失败，本地存档没有被动过。'
+        exit 1
+    }
     $behind = [int](Invoke-Git -Arguments @('rev-list', '--count', "HEAD..$upstream"))
     $ahead = [int](Invoke-Git -Arguments @('rev-list', '--count', "$upstream..HEAD"))
 
@@ -645,6 +896,14 @@ try {
             Write-Host '完成。现在可以叫朋友双击 pull.bat 了。' -ForegroundColor Green
         }
     }
+}
+catch {
+    # 统一把异常收成一行可读的中文。直接 throw 到外面时 PowerShell 会把整段
+    # 消息按错误格式再刷一遍堆栈，看起来像出了大事，其实只是一句话的提示。
+    Write-Host ''
+    Write-Host $_.Exception.Message -ForegroundColor Red
+    Write-Host '已停在这一步，没有继续改动存档。' -ForegroundColor DarkGray
+    exit 1
 }
 finally {
     if ($worldLock) { $worldLock.Dispose() }

@@ -124,6 +124,9 @@ powershell -ExecutionPolicy Bypass -File scripts\sync.ps1 push -Yes
 # 网络不稳时指定自动重试次数
 powershell -ExecutionPolicy Bypass -File scripts\sync.ps1 push -PushRetries 5
 
+# 手动指定代理（不填时脚本会自动探测本机正在运行的代理）
+powershell -ExecutionPolicy Bypass -File scripts\sync.ps1 push -Proxy http://127.0.0.1:10808
+
 # 调整分段大小（默认 64 MB，网络差就调小，0 = 不分段）
 powershell -ExecutionPolicy Bypass -File scripts\sync.ps1 push -SegmentMB 32
 ```
@@ -134,11 +137,32 @@ push 在复制前显示 Robocopy 文件变化预览，其中 New File 为新增�
 
 如果提交已经成功、推送因网络或权限失败，提交会保留在本地，存档也已经复制进仓库了，不需要重新选世界或重新复制。处理网络或权限问题后，再次双击 push.bat 即可重试。
 
+### 连不上 GitHub 时脚本会自己换路
+
+常见报错是这一种，它和存档、账号权限都没有关系：
+
+```
+fatal: unable to access 'https://github.com/...': Failed to connect to github.com port 443 after 21110 ms: Could not connect to server
+```
+
+这是本机到 github.com 的直连时通时不通（多见于国内宽带）。以前这种情况只能干等，现在脚本每次做网络操作前会先花几秒探测直连：
+
+- 直连通 → 走直连，最快；
+- 直连不通 → 自动借用本机正在运行的代理（v2rayN 的 `10808`、Clash 的 `7890/7897`、`1080` 等），只用 `-c http.proxy=` 对这一次 git 命令生效，**不改你的 git 全局配置**；
+- 每条通路都带重试，`fetch` 和 `push` 都覆盖；
+- 全部失败才停下，并且只打一段可读的中文说明，不再抛 PowerShell 堆栈。
+
+远端是本地路径或 `file://` 时不走这套探测，直接执行。
+
+想固定用某个代理就加 `-Proxy`，例如 `push.bat -Proxy socks5h://127.0.0.1:10808`。
+
+### 大包推送被掐断
+
 推送中断（`RPC failed; curl 55`、`Connection was reset`、`the remote end hung up`）通常是因为一次要传上百 MB，大包在传输或等待服务器处理的过程中被中间网络掐断。脚本为此做了四件事：
 
 1. **分段推送**：一次改动较大时，按体积切成若干段（默认每段约 64 MB），提交一段就推一段。断在某一段时前面几段已经在云端，下次运行从断掉的地方接着推，不用从头再来。每段大小可用 `-SegmentMB` 调整，`0` 表示不分段。
 2. 把本仓库的 `http.postBuffer` 调到 500 MB、改用 HTTP/1.1（这两个是大包推送被重置的常见解法）。
-3. 每段失败后自动重试 3 次，次数可用 `-PushRetries` 调整。
+3. 每段失败后自动重试 3 次，并在直连不通时换本机代理，次数可用 `-PushRetries` 调整。
 4. 全部失败时按提示检查权限、换网络或改用 SSH。
 
 分段推送期间云端是「新旧混合」的中间状态，全部推完之前不要叫朋友 pull。存档越大、一次玩得越久，需要传的数据就越多，尽量每次玩完就 push。
