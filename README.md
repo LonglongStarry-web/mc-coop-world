@@ -120,13 +120,28 @@ powershell -ExecutionPolicy Bypass -File scripts\sync.ps1 push -WorldName "新�
 
 # 推送并跳过确认（要挂到别的自动化里时用；此时自动采用上次同步的世界）
 powershell -ExecutionPolicy Bypass -File scripts\sync.ps1 push -Yes
+
+# 网络不稳时指定自动重试次数
+powershell -ExecutionPolicy Bypass -File scripts\sync.ps1 push -PushRetries 5
+
+# 调整分段大小（默认 64 MB，网络差就调小，0 = 不分段）
+powershell -ExecutionPolicy Bypass -File scripts\sync.ps1 push -SegmentMB 32
 ```
 
 同步时会检查网络和远端进度，网络失败会停止。远端有新提交时，push 会在复制前停止。请先备份你当前正在玩的进度，再决定采用哪一份存档，避免覆盖需要保留的内容。
 
 push 在复制前显示 Robocopy 文件变化预览，其中 New File 为新增文件，Newer 等标记表示文件变化，EXTRA 表示目标中多出的文件。确认后两端目录会保持一致，包括同步删除。取消操作会直接退出。
 
-如果提交已经成功、推送因网络或权限失败，提交会保留在本地。处理网络或权限问题后，再次双击 push.bat 即可重试，无需再修改存档。
+如果提交已经成功、推送因网络或权限失败，提交会保留在本地，存档也已经复制进仓库了，不需要重新选世界或重新复制。处理网络或权限问题后，再次双击 push.bat 即可重试。
+
+推送中断（`RPC failed; curl 55`、`Connection was reset`、`the remote end hung up`）通常是因为一次要传上百 MB，大包在传输或等待服务器处理的过程中被中间网络掐断。脚本为此做了四件事：
+
+1. **分段推送**：一次改动较大时，按体积切成若干段（默认每段约 64 MB），提交一段就推一段。断在某一段时前面几段已经在云端，下次运行从断掉的地方接着推，不用从头再来。每段大小可用 `-SegmentMB` 调整，`0` 表示不分段。
+2. 把本仓库的 `http.postBuffer` 调到 500 MB、改用 HTTP/1.1（这两个是大包推送被重置的常见解法）。
+3. 每段失败后自动重试 3 次，次数可用 `-PushRetries` 调整。
+4. 全部失败时按提示检查权限、换网络或改用 SSH。
+
+分段推送期间云端是「新旧混合」的中间状态，全部推完之前不要叫朋友 pull。存档越大、一次玩得越久，需要传的数据就越多，尽量每次玩完就 push。
 
 pull 前会把本地世界备份到同级的 `<世界名>.bak-<时间>-<编号>` 文件夹。备份失败会停止导入。恢复时先退出世界，将当前世界另存，再把备份文件夹改回原世界名。备份不会自动删除，会占用本地磁盘空间，可确认无需恢复后自行清理。选择世界时会排除这些备份。
 

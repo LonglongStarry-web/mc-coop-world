@@ -17,6 +17,12 @@
 
     push 会先列出这次到底改了哪些文件、多大，你确认之后才提交和推送。
     不想确认就加 -Yes（此时自动采用上次同步的世界）。
+
+    分段推送：一次改动很大时（比如连续玩了两天），单个推送包可能有上百 MB，
+    这种大包很容易被网络中途重置。所以 push 会把改动按体积切成若干段
+    （默认每段约 64 MB），提交一段、推一段。断在某一段时，前面几段已经在云端，
+    下次再跑 push 会从断掉的地方接着推。-SegmentMB 可调整每段大小，0 = 不分段。
+
     pull 会先更新 Git 仓库，再备份并完整同步本地世界。
     两边的存档目录会保持一致，包括同步文件删除。
 
@@ -31,6 +37,9 @@
 
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File scripts\sync.ps1 push -WorldName "新的世界 (2)"
+
+.EXAMPLE
+    powershell -ExecutionPolicy Bypass -File scripts\sync.ps1 push -SegmentMB 32
 #>
 [CmdletBinding()]
 param(
@@ -50,7 +59,16 @@ param(
     [string]$SavesDir,
 
     # push 时跳过确认和选择，直接提交推送
-    [switch]$Yes
+    [switch]$Yes,
+
+    # 推送失败（网络重置）时自动重试的次数，默认 3；重试是从头再传一遍
+    [ValidateRange(1, 10)]
+    [int]$PushRetries = 3,
+
+    # 分段推送：每段大约多少 MB。一次推几百 MB 容易被网络掐断，
+    # 分成几十 MB 一段、推完一段再推下一段成功率高很多。0 表示不分段。
+    [ValidateRange(0, 1024)]
+    [double]$SegmentMB = 64
 )
 
 $ErrorActionPreference = 'Stop'
@@ -113,6 +131,114 @@ function Invoke-Git {
     $result = & git -C $repoRoot @Arguments
     if ($LASTEXITCODE -ne 0) { throw "Git 操作失败：git $($Arguments -join ' ')。请处理上面的错误后重试。" }
     return $result
+}
+
+# 存档一次动辄上百 MB。一次性推这么大的包很容易被中间网络重置
+# （curl 55 / RPC failed; Connection was reset / the remote end hung up），
+# 所以这里做两件事：调本仓库的 HTTP 设置，失败后自动重试。重试是从头再传一遍，Git 没有断点续传。
+# 返回 $true 表示确实推上去了。
+function Invoke-PushWithRetry {
+    param([int]$Attempts = 3)
+
+    & git -C $repoRoot config http.postBuffer 524288000 | Out-Null
+    & git -C $repoRoot config http.version HTTP/1.1 | Out-Null
+
+    $branch = (& git -C $repoRoot branch --show-current)
+    if ($branch) { $branch = $branch.Trim() }
+    $head = (& git -C $repoRoot rev-parse HEAD)
+    if ($head) { $head = $head.Trim() }
+
+    for ($i = 1; $i -le $Attempts; $i++) {
+        if ($i -gt 1) {
+            Write-Host "第 $i/$Attempts 次重试推送。每次都是从头发送，数据量大时需要几分钟，别关窗口。" -ForegroundColor Cyan
+        }
+
+        $null = & git -C $repoRoot push
+        if ($LASTEXITCODE -eq 0) { return $true }
+
+        if ($i -lt $Attempts) {
+            $wait = 5 * $i
+            Write-Host "推送中断（连接被重置），$wait 秒后自动重试。" -ForegroundColor Yellow
+            Start-Sleep -Seconds $wait
+        }
+    }
+
+    # 全部失败后再核对一次远端：可能包已经送到，只是回执阶段被掐断，避免白重传。
+    # 只在最后查一次，因为连不上时这个查询本身也要等 20 多秒。
+    if ($branch -and $head) {
+        $remoteSha = $null
+        try {
+            $remoteRef = & git -C $repoRoot ls-remote origin "refs/heads/$branch"
+            if ($LASTEXITCODE -eq 0 -and $remoteRef) { $remoteSha = ($remoteRef -split '\s+')[0] }
+        }
+        catch { $remoteSha = $null }
+
+        if ($remoteSha -eq $head) {
+            Write-Host '连接报了错，但远端已经收到这次提交，按成功处理。' -ForegroundColor Yellow
+            return $true
+        }
+    }
+
+    return $false
+}
+
+# 列出 world/ 下相对当前提交改动过的文件，带体积，用于分批推送。
+function Get-ChangedWorldPaths {
+    $raw = Invoke-Git -Arguments @('-c', 'status.renames=false', 'status', '--porcelain', '-uall', '-z', '--', 'world')
+    $text = ($raw -join '')
+    $items = @()
+    foreach ($rec in ($text -split "`0")) {
+        if (-not $rec -or $rec.Length -le 3) { continue }
+        $rel = $rec.Substring(3)
+        $full = Join-Path $repoRoot ($rel -replace '/', '\')
+        $size = 0
+        if (Test-Path -LiteralPath $full -PathType Leaf) {
+            $size = (Get-Item -LiteralPath $full).Length
+        }
+        $items += [pscustomobject]@{ Path = $rel; Size = [double]$size }
+    }
+    return $items
+}
+
+# 按体积和文件数把改动切成若干段，避免单次推送的包过大。
+function Split-WorldChanges {
+    param([object[]]$Items, [double]$LimitBytes)
+
+    $batches = New-Object System.Collections.ArrayList
+    $cur = New-Object System.Collections.ArrayList
+    $curSize = 0.0
+
+    foreach ($it in $Items) {
+        # 单批不超过 40 个文件，免得命令行过长
+        if ($cur.Count -gt 0 -and (($curSize + $it.Size) -gt $LimitBytes -or $cur.Count -ge 40)) {
+            [void]$batches.Add(@($cur))
+            $cur.Clear()
+            $curSize = 0.0
+        }
+        [void]$cur.Add($it)
+        $curSize += $it.Size
+    }
+    if ($cur.Count -gt 0) { [void]$batches.Add(@($cur)) }
+    return $batches
+}
+
+function Show-PushFailHelp {
+    param([string]$Stage)
+
+    Write-Host ''
+    if ($Stage) { Write-Host $Stage -ForegroundColor Red }
+    else { Write-Host '推送没成功：连接被重置，或者没有推送权限，远端还是旧进度。' -ForegroundColor Red }
+    Write-Host @'
+你的提交已经存在本地，存档也已经复制进仓库了，不需要重新选世界或重新复制。
+等网络好一些，直接再双击 push.bat 就行，它会接着把还没推上去的部分传上去。
+
+如果一直失败，可以试：
+  1. 核对登录的 GitHub 账号有没有这个仓库的写权限（协作者邀请要点接受）；
+  2. 换网络（手机热点通常比某些宽带稳），或者挂上代理再推；
+  3. 改用 SSH 方式，通常比 HTTPS 稳（尤其是大文件上传总被重置时）：
+     git remote set-url origin git@github.com:LonglongStarry-web/mc-coop-world.git
+     需要先在 GitHub 里配置好 SSH 公钥，配置方法见使用指南。
+'@ -ForegroundColor Yellow
 }
 
 function Assert-World {
@@ -387,7 +513,9 @@ try {
             if ($ahead -gt 0) {
                 throw '本地还有未推送的提交。请先运行 push.bat 交接本地进度，再拉取。'
             }
-            $dirty = Invoke-Git -Arguments @('status', '--porcelain')
+            # 只检查已跟踪文件的改动；仓库里多出来的杂项文件不该拦住拉取，
+            # 真要覆盖它们时 git merge 自己会报错并停下。
+            $dirty = Invoke-Git -Arguments @('status', '--porcelain', '--untracked-files=no')
             if ($dirty) { throw '仓库中有未提交的改动。请先提交或备份处理这些改动，再拉取。' }
 
             Invoke-Git -Arguments @('merge', '--ff-only', $upstream) | Out-Host
@@ -447,23 +575,72 @@ try {
             }
 
             Invoke-Robocopy -Source $localWorld -Dest $repoWorld
-            Invoke-Git -Arguments @('add', '--', 'world')
-            $changes = Invoke-Git -Arguments @('diff', '--cached', '--name-only', '--', 'world')
-            if ($changes) {
-                Invoke-Git -Arguments @('diff', '--cached', '--stat', '--', 'world') | Out-Host
-                $stamp = Get-Date -Format 'yyyy-MM-dd HH:mm'
-                # 只提交存档，避免把其他已经暂存的文件一并提交。
-                # 提交信息里的中文在控制台上会显示成乱码（git 输出 UTF-8，cmd 按本地代码页读），
-                # 但存进仓库的内容是正确的，所以这里不直接显示 git 的原始输出。
-                Invoke-Git -Arguments @('commit', '--only', '-m', "sync: $WorldName @ $stamp", '--', 'world') | Out-Null
-                $head = Invoke-Git -Arguments @('rev-parse', '--short', 'HEAD')
-                Write-Host "已提交存档：$head  sync: $WorldName @ $stamp"
+            $stamp = Get-Date -Format 'yyyy-MM-dd HH:mm'
+            $changes = @(Get-ChangedWorldPaths)
+            $totalBytes = 0.0
+            foreach ($c in $changes) { $totalBytes += $c.Size }
+
+            Write-Host '[4/4] 提交并推送进度'
+
+            if ($changes.Count -eq 0) {
+                # 没有新改动，但本地可能还有上次没推上去的提交
+                if (-not (Invoke-PushWithRetry -Attempts $PushRetries)) {
+                    Show-PushFailHelp
+                    exit 1
+                }
+            }
+            else {
+                # 一次传几百 MB 很容易被掐断，所以按体积切成若干段：每段提交一次就推一次，
+                # 断在某一段时，前面几段已经在云端了，下次接着推剩下的部分。
+                $limit = [double]::MaxValue
+                if ($SegmentMB -gt 0) { $limit = $SegmentMB * 1MB }
+                $batches = @(Split-WorldChanges -Items $changes -LimitBytes $limit)
+
+                if ($batches.Count -gt 1) {
+                    Write-Host ("这次改动 {0:N1} MB / {1} 个文件，分成 {2} 段逐步推送（每段约 {3:N0} MB）。" -f ($totalBytes / 1MB), $changes.Count, $batches.Count, $SegmentMB) -ForegroundColor Cyan
+                    Write-Host '全部推完之前先别叫朋友 pull，他那边会拿到新旧混合的存档。' -ForegroundColor Yellow
+                }
+
+                for ($b = 0; $b -lt $batches.Count; $b++) {
+                    $batch = @($batches[$b])
+                    $paths = @($batch | ForEach-Object { $_.Path })
+                    $batchBytes = 0.0
+                    foreach ($f in $batch) { $batchBytes += $f.Size }
+
+                    if ($batches.Count -gt 1) {
+                        Write-Host ("  第 {0}/{1} 段：{2} 个文件，{3:N1} MB" -f ($b + 1), $batches.Count, $paths.Count, ($batchBytes / 1MB)) -ForegroundColor Cyan
+                    }
+
+                    Invoke-Git -Arguments (@('add', '--') + $paths) | Out-Null
+
+                    $msg = "sync: $WorldName @ $stamp"
+                    if ($batches.Count -gt 1) { $msg = "$msg ($($b + 1)/$($batches.Count))" }
+
+                    # 只提交这一段涉及的文件，别把其他已经暂存的改动一并提交。
+                    # 提交信息里的中文在控制台上会显示成乱码（git 输出 UTF-8，cmd 按本地代码页读），
+                    # 但存进仓库的内容是正确的，所以这里不直接回显 git 的原始输出。
+                    Invoke-Git -Arguments (@('commit', '--only', '-m', $msg, '--') + $paths) | Out-Null
+                    $short = Invoke-Git -Arguments @('rev-parse', '--short', 'HEAD')
+                    Write-Host "已提交存档：$short  $msg"
+
+                    if (-not (Invoke-PushWithRetry -Attempts $PushRetries)) {
+                        if ($batches.Count -gt 1) {
+                            if ($b -eq 0) {
+                                Show-PushFailHelp -Stage '分段推送第 1 段就没推上去，云端还是旧进度。'
+                            }
+                            else {
+                                Show-PushFailHelp -Stage "分段推送中断：前 $b 段已经在云端，第 $($b + 1)/$($batches.Count) 段没推上去。"
+                            }
+                            Write-Host '剩下的改动还在本地，网络好一些再双击 push.bat，会从断掉的那一段接着推。' -ForegroundColor Yellow
+                        }
+                        else {
+                            Show-PushFailHelp
+                        }
+                        exit 1
+                    }
+                }
             }
 
-            Write-Host '[4/4] 推送进度'
-            # 即使文件没有新变化，也推送先前因断网或权限问题留在本地的提交。
-            # 失败时保留提交，恢复网络或权限后再次双击 push.bat 即可重试。
-            Invoke-Git -Arguments @('push') | Out-Host
             Save-SyncState -World $WorldName -Saves $SavesDir
             Write-Host '完成。现在可以叫朋友双击 pull.bat 了。' -ForegroundColor Green
         }
