@@ -19,6 +19,8 @@ desktop.ini
 # 每台机器的游戏路径都不一样，提交上去两人一改就冲突。
 # 模板是 game-dir.sample.txt，复制改名成 game-dir.txt 自用。
 game-dir.txt
+# 脚本记下的「上次同步的是哪个世界」，本机自用，不要提交
+.sync-state.json
 
 # ---- 本地备份 / 临时文件 ----
 *.bak

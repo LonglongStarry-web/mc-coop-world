@@ -7,9 +7,16 @@
           覆盖前会把本地存档整份备份一份，搞坏了能回退。
 
     push  本机存档  ->  仓库 world/
-          会先列出这次到底改了哪些文件、多大，你确认之后才提交和推送。
-          不想确认就加 -Yes。
+          只推送你在列表里选中的那一个世界，不会再自己挑。
 
+    世界选择：
+      每次运行都会列出 saves 目录里的世界，按最后游玩时间从新到旧排序，
+      标出每个世界的文件夹名、修改时间和体积。输入序号选定。
+      直接回车 = 上次同步过的那个世界（记在 .sync-state.json 里）。
+      输入 q 取消。
+
+    push 会先列出这次到底改了哪些文件、多大，你确认之后才提交和推送。
+    不想确认就加 -Yes（此时自动采用上次同步的世界）。
     pull 会先更新 Git 仓库，再备份并完整同步本地世界。
     两边的存档目录会保持一致，包括同步文件删除。
 
@@ -21,6 +28,9 @@
 
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File scripts\sync.ps1 push -Yes
+
+.EXAMPLE
+    powershell -ExecutionPolicy Bypass -File scripts\sync.ps1 push -WorldName "新的世界 (2)"
 #>
 [CmdletBinding()]
 param(
@@ -28,7 +38,8 @@ param(
     [ValidateSet('pull', 'push')]
     [string]$Mode,
 
-    # 世界文件夹名。不填就自动列出存档目录让你选。
+    # 世界文件夹名（要写 saves 下的真实文件夹名，不是游戏里显示的名字）。
+    # 不填就列出存档目录让你选。
     [string]$WorldName,
 
     # 游戏目录（里面要有 saves 那一层）。不填就读仓库根目录的 game-dir.txt，
@@ -38,7 +49,7 @@ param(
     # 直接指定存档目录，优先级最高，一般只有测试时才用
     [string]$SavesDir,
 
-    # push 时跳过确认，直接提交推送
+    # push 时跳过确认和选择，直接提交推送
     [switch]$Yes
 )
 
@@ -66,25 +77,10 @@ if (-not $SavesDir) {
     $SavesDir = Join-Path $GameDir 'saves'
 }
 
-if (-not (Test-Path -LiteralPath $SavesDir)) {
-    # 第一次玩的人可能连 saves 都还没有，pull 的时候直接建出来
-    if ($Mode -eq 'pull') {
-        New-Item -ItemType Directory -Path $SavesDir -Force | Out-Null
-        Write-Host "存档目录不存在，已新建：$SavesDir" -ForegroundColor Yellow
-    }
-    else {
-        throw @"
-找不到存档目录：$SavesDir
+$SavesDir = [IO.Path]::GetFullPath($SavesDir)
 
-你的游戏可能不是默认安装位置。解决办法：
-在仓库根目录的 game-dir.txt 里写上游戏目录（含 saves 的那一层），只写路径，例如：
-
-    E:\HMCL\HMCL3.9.1\.minecraft
-
-改完再跑一次就行。
-"@
-    }
-}
+# 记住上次同步的是哪个世界，下次默认就选它。
+$stateFile = Join-Path $repoRoot '.sync-state.json'
 
 # ---------------------------------------------------------------- 小工具
 
@@ -144,8 +140,75 @@ function Assert-NoLinks {
     }
 }
 
-function Resolve-WorldName {
-    param([string]$Name, [string]$Saves, [switch]$AllowNew)
+# ---------------------------------------------------------------- 世界选择
+
+# 名字去掉结尾的 " (2)" " (3)" 这类副本后缀，用来识别同名副本
+function Get-WorldKey {
+    param([string]$Name)
+    return ($Name -replace '\s*\(\d+\)\s*$', '').Trim()
+}
+
+function Get-SavedWorlds {
+    param([string]$Saves)
+    if (-not (Test-Path -LiteralPath $Saves)) { return @() }
+    return @(Get-ChildItem -LiteralPath $Saves -Directory -ErrorAction SilentlyContinue |
+             Where-Object { $_.Name -notlike '*.bak-*' } |
+             Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'level.dat') })
+}
+
+function Get-WorldInfo {
+    param([string]$Path)
+    $bytes = (Get-ChildItem -LiteralPath $Path -Recurse -File -ErrorAction SilentlyContinue |
+              Measure-Object -Property Length -Sum).Sum
+    if (-not $bytes) { $bytes = 0 }
+    # 用 level.dat 的修改时间当「最后游玩时间」，比文件夹时间准
+    $stamp = $null
+    $level = Join-Path $Path 'level.dat'
+    if (Test-Path -LiteralPath $level) { $stamp = (Get-Item -LiteralPath $level).LastWriteTime }
+    if (-not $stamp) { $stamp = (Get-Item -LiteralPath $Path).LastWriteTime }
+    return [pscustomobject]@{ Bytes = [double]$bytes; Time = $stamp }
+}
+
+function Get-SyncState {
+    if (-not (Test-Path -LiteralPath $stateFile)) { return $null }
+    try {
+        return (Get-Content -LiteralPath $stateFile -Raw -Encoding UTF8 | ConvertFrom-Json)
+    }
+    catch { return $null }
+}
+
+function Save-SyncState {
+    param([string]$World, [string]$Saves)
+    $data = [ordered]@{
+        world   = $World
+        saves   = $Saves
+        updated = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+    }
+    try {
+        [IO.File]::WriteAllText($stateFile, ($data | ConvertTo-Json), (New-Object Text.UTF8Encoding($false)))
+    }
+    catch {
+        # 记不住不影响同步，只是下次要手动选
+        Write-Host "（提示：没能写入 $stateFile，下次请手动选世界）" -ForegroundColor DarkGray
+    }
+}
+
+function Get-LastSyncedWorld {
+    $state = Get-SyncState
+    if (-not $state) { return $null }
+    if (-not $state.world) { return $null }
+    # 换了存档目录（比如换了启动器）时，旧记录不算数
+    if ($state.saves -and ($state.saves -ne $SavesDir)) { return $null }
+    return [string]$state.world
+}
+
+function Select-World {
+    param(
+        [string]$Name,
+        [string]$Saves,
+        [switch]$AllowNew,
+        [switch]$NoPrompt
+    )
 
     if ($Name) {
         $path = Join-Path $Saves $Name
@@ -160,48 +223,115 @@ function Resolve-WorldName {
         else { throw "找不到 Minecraft 存档目录：$Saves" }
     }
 
-    $worlds = @(Get-ChildItem -LiteralPath $Saves -Directory |
-                Where-Object { $_.Name -notlike '*.bak-*' } |
-                Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'level.dat') })
+    $worlds = @(Get-SavedWorlds -Saves $Saves)
 
     if ($worlds.Count -eq 0) {
         # 全新机器，本地一个世界都没有：让他自己起个名字，pull 会建成这个
-        if ($AllowNew) {
-            Write-Host '你本地还没有任何世界，这次会新建一个。' -ForegroundColor Cyan
+        if (-not $AllowNew) { throw "这个目录下没有可用的世界：$Saves" }
+        Write-Host '你本地还没有任何世界，这次会新建一个。' -ForegroundColor Cyan
+        while ($true) {
+            $newName = Read-Host '给这个存档起个名字（随便起，比如 双人世界）'
+            if ($newName -and $newName.Trim()) { return $newName.Trim() }
+            Write-Host '名字不能为空。' -ForegroundColor Yellow
+        }
+    }
+
+    $rows = @()
+    foreach ($w in $worlds) {
+        $info = Get-WorldInfo -Path $w.FullName
+        $rows += [pscustomobject]@{ Name = $w.Name; Time = $info.Time; MB = ($info.Bytes / 1MB) }
+    }
+    $rows = @($rows | Sort-Object -Property Time -Descending)
+
+    # 统计同名副本，用于提示
+    $keys = @{}
+    foreach ($r in $rows) {
+        $k = Get-WorldKey -Name $r.Name
+        if (-not $keys.ContainsKey($k)) { $keys[$k] = 0 }
+        $keys[$k] = $keys[$k] + 1
+    }
+
+    $lastWorld = Get-LastSyncedWorld
+    $default = 1
+    if ($lastWorld) {
+        for ($i = 0; $i -lt $rows.Count; $i++) {
+            if ($rows[$i].Name -eq $lastWorld) { $default = $i + 1; break }
+        }
+    }
+
+    if ($Mode -eq 'push') {
+        Write-Host '你 saves 目录里的世界（选中的那个会被推送到云端，覆盖云端存档）：' -ForegroundColor Cyan
+    }
+    else {
+        Write-Host '你 saves 目录里的世界（选中的那个会被云端存档覆盖）：' -ForegroundColor Cyan
+    }
+
+    for ($i = 0; $i -lt $rows.Count; $i++) {
+        $r = $rows[$i]
+        $isDefault = (($i + 1) -eq $default)
+        $mark = '   '
+        if ($isDefault) { $mark = ' → ' }
+        $line = '  {0}[{1}]  {2}  {3,9:N1} MB  {4}' -f $mark, ($i + 1), $r.Time.ToString('yyyy-MM-dd HH:mm'), $r.MB, $r.Name
+
+        $tags = @()
+        if ($lastWorld -and $r.Name -eq $lastWorld) { $tags += '上次同步' }
+        if ($keys[(Get-WorldKey -Name $r.Name)] -gt 1) { $tags += '同名副本' }
+        if ($tags.Count) { $line = $line + '   (' + ($tags -join '、') + ')' }
+
+        if ($isDefault) { Write-Host $line -ForegroundColor Green }
+        else { Write-Host $line }
+    }
+
+    $dupKeys = @($keys.GetEnumerator() | Where-Object { $_.Value -gt 1 })
+    if ($dupKeys.Count -gt 0) {
+        Write-Host '注意：上面标了「同名副本」的世界，名字很像但文件夹不同，游戏里显示的名字也可能一样。' -ForegroundColor Yellow
+        Write-Host '      请按「文件夹名」和「修改时间」确认哪个才是你现在在玩的，选错会推错存档。' -ForegroundColor Yellow
+    }
+
+    if ($NoPrompt) {
+        $auto = $rows[$default - 1].Name
+        Write-Host "自动选择：$auto" -ForegroundColor Green
+        return $auto
+    }
+
+    $hint = "输入序号（回车 = $default"
+    if ($AllowNew) { $hint = "$hint，n = 新建" }
+    $hint = "$hint，q = 取消）"
+
+    while ($true) {
+        $pick = Read-Host $hint
+        if ($null -eq $pick) { $pick = '' } else { $pick = $pick.Trim() }
+
+        if ($pick -eq '') { return $rows[$default - 1].Name }
+
+        if ($pick -in @('q', 'Q')) {
+            Write-Host '已取消。' -ForegroundColor Yellow
+            exit 0
+        }
+
+        if ($AllowNew -and ($pick -in @('n', 'N'))) {
             while ($true) {
-                $newName = Read-Host '给这个存档起个名字（随便起，比如 双人世界）'
+                $newName = Read-Host '给这个新存档起个名字'
                 if ($newName -and $newName.Trim()) { return $newName.Trim() }
                 Write-Host '名字不能为空。' -ForegroundColor Yellow
             }
         }
-        throw "这个目录下没有可用的世界：$Saves"
-    }
 
-    if ($worlds.Count -eq 1) { return $worlds[0].Name }
-
-    # 列出名字、最后修改时间、体积，方便认出哪个是在玩的那个
-    Write-Host '找到多个世界，选一个：' -ForegroundColor Cyan
-    for ($i = 0; $i -lt $worlds.Count; $i++) {
-        $w = $worlds[$i]
-        $bytes = (Get-ChildItem -LiteralPath $w.FullName -Recurse -File -ErrorAction SilentlyContinue |
-                  Measure-Object -Property Length -Sum).Sum
-        if (-not $bytes) { $bytes = 0 }
-        Write-Host ('  [{0}]  {1}  {2,10:N1} MB  ' -f ($i + 1), $w.LastWriteTime.ToString('yyyy-MM-dd HH:mm'), ($bytes / 1MB)) -NoNewline
-        Write-Host $w.Name
-    }
-    while ($true) {
-        $pick = Read-Host '输入序号'
         $n = 0
-        if ([int]::TryParse($pick, [ref]$n) -and $n -ge 1 -and $n -le $worlds.Count) {
-            return $worlds[$n - 1].Name
+        if ([int]::TryParse($pick, [ref]$n) -and $n -ge 1 -and $n -le $rows.Count) {
+            return $rows[$n - 1].Name
         }
-        Write-Host '序号不对，重新输入。' -ForegroundColor Yellow
+        Write-Host '输入无效，请输入列表里的序号。' -ForegroundColor Yellow
     }
 }
 
-# ---------------------------------------------------------------- 主流程
+# ---------------------------------------------------------------- 选世界
 
-$WorldName = Resolve-WorldName -Name $WorldName -Saves $SavesDir -AllowNew:($Mode -eq 'pull')
+$NoPrompt = $Yes.IsPresent -or [Console]::IsInputRedirected
+
+Write-Host '[1/4] 选择存档'
+$WorldName = Select-World -Name $WorldName -Saves $SavesDir -AllowNew:($Mode -eq 'pull') -NoPrompt:$NoPrompt
+
 # 同时检查命令行参数和交互输入。
 if ($WorldName -in @('.', '..') -or
     $WorldName.IndexOfAny([IO.Path]::GetInvalidFileNameChars()) -ge 0 -or
@@ -222,6 +352,8 @@ Assert-NoLinks -Path $repoWorld
 Write-Host "仓库：$repoRoot"
 Write-Host "世界：$localWorld"
 Write-Host ''
+
+# ---------------------------------------------------------------- 主流程
 
 # 防止两个同步窗口同时改同一仓库。
 $gitTop = [IO.Path]::GetFullPath((Invoke-Git -Arguments @('rev-parse', '--show-toplevel')))
@@ -245,7 +377,7 @@ try {
     # 所有网络错误都停止，避免把旧仓库存档当作最新进度导入游戏。
     $upstream = Invoke-Git -Arguments @('rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}')
     $remoteName = Invoke-Git -Arguments @('config', "branch.$(Invoke-Git -Arguments @('branch', '--show-current')).remote")
-    Write-Host '[1/3] 检查远端进度'
+    Write-Host '[2/4] 检查远端进度'
     Invoke-Git -Arguments @('fetch', $remoteName) | Out-Host
     $behind = [int](Invoke-Git -Arguments @('rev-list', '--count', "HEAD..$upstream"))
     $ahead = [int](Invoke-Git -Arguments @('rev-list', '--count', "$upstream..HEAD"))
@@ -265,18 +397,20 @@ try {
 
             if (Test-Path -LiteralPath $localWorld) {
                 $backup = "$localWorld.bak-$(Get-Date -Format 'yyyyMMdd-HHmmss-fff')-$([Guid]::NewGuid().ToString('N').Substring(0, 8))"
-                Write-Host "[2/3] 备份本地存档 -> $backup"
+                Write-Host "[3/4] 备份本地存档 -> $backup"
                 Invoke-Robocopy -Source $localWorld -Dest $backup -Backup
             }
             else {
-                Write-Host '[2/3] 本地没有这个存档，直接新建'
+                Write-Host '[3/4] 本地没有这个存档，直接新建'
                 New-Item -ItemType Directory -Path $localWorld | Out-Null
                 $worldLock = [IO.File]::Open((Join-Path $localWorld 'session.lock'), 'OpenOrCreate', 'ReadWrite', 'None')
             }
 
-            Write-Host '[3/3] 导入最新存档'
+            Write-Host '[4/4] 导入最新存档'
             Invoke-Robocopy -Source $repoWorld -Dest $localWorld
+            Save-SyncState -World $WorldName -Saves $SavesDir
             Write-Host "完成。存档在：$localWorld" -ForegroundColor Green
+            Write-Host "进游戏请选文件夹名为「$WorldName」的那个世界。" -ForegroundColor Green
         }
 
         'push' {
@@ -285,14 +419,27 @@ try {
                 throw "远端有 $behind 个本地没有的提交。请先备份当前游戏存档，再拉取并确认采用哪份进度。"
             }
 
+            # 和脚本记住的上次同步世界对比，用来发现「选错了世界」。
+            # 不用 git log 里的中文提交信息判断，那会受控制台代码页影响变成乱码。
+            $prevWorld = Get-LastSyncedWorld
+            if ($prevWorld) {
+                if ($prevWorld -ne $WorldName) {
+                    Write-Host "上次同步的是「$prevWorld」，这次你选的是「$WorldName」。" -ForegroundColor Yellow
+                    Write-Host '如果没打算换存档，说明选错了：这次推送会用本地这一份覆盖云端进度。' -ForegroundColor Yellow
+                }
+                else {
+                    Write-Host "和上次同步的是同一个世界：$prevWorld" -ForegroundColor DarkGray
+                }
+            }
+
             # 先检查提交身份，避免复制后才发现 Git 尚未配置姓名和邮箱。
             Invoke-Git -Arguments @('var', 'GIT_AUTHOR_IDENT') | Out-Null
             Invoke-Git -Arguments @('var', 'GIT_COMMITTER_IDENT') | Out-Null
-            Write-Host '[2/3] 预览存档变化（字节数为文件大小，传输量取决于 Git 压缩）'
+            Write-Host '[3/4] 预览存档变化（字节数为文件大小，传输量取决于 Git 压缩）'
             Invoke-Robocopy -Source $localWorld -Dest $repoWorld -Preview
             if (-not $Yes) {
                 Write-Host '目标目录将与本地世界一致，包括删除目标中多出的存档文件。' -ForegroundColor Yellow
-                $answer = Read-Host '确认同步并推送？(Y/n)'
+                $answer = Read-Host "确认用「$WorldName」同步并推送？(Y/n)"
                 if ($answer -and $answer.Trim().ToLower() -notin @('', 'y', 'yes')) {
                     Write-Host '已取消。' -ForegroundColor Yellow
                     exit 0
@@ -306,13 +453,18 @@ try {
                 Invoke-Git -Arguments @('diff', '--cached', '--stat', '--', 'world') | Out-Host
                 $stamp = Get-Date -Format 'yyyy-MM-dd HH:mm'
                 # 只提交存档，避免把其他已经暂存的文件一并提交。
-                Invoke-Git -Arguments @('commit', '--only', '-m', "sync: $WorldName @ $stamp", '--', 'world') | Out-Host
+                # 提交信息里的中文在控制台上会显示成乱码（git 输出 UTF-8，cmd 按本地代码页读），
+                # 但存进仓库的内容是正确的，所以这里不直接显示 git 的原始输出。
+                Invoke-Git -Arguments @('commit', '--only', '-m', "sync: $WorldName @ $stamp", '--', 'world') | Out-Null
+                $head = Invoke-Git -Arguments @('rev-parse', '--short', 'HEAD')
+                Write-Host "已提交存档：$head  sync: $WorldName @ $stamp"
             }
 
-            Write-Host '[3/3] 推送进度'
+            Write-Host '[4/4] 推送进度'
             # 即使文件没有新变化，也推送先前因断网或权限问题留在本地的提交。
             # 失败时保留提交，恢复网络或权限后再次双击 push.bat 即可重试。
             Invoke-Git -Arguments @('push') | Out-Host
+            Save-SyncState -World $WorldName -Saves $SavesDir
             Write-Host '完成。现在可以叫朋友双击 pull.bat 了。' -ForegroundColor Green
         }
     }
